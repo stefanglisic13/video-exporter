@@ -34,6 +34,7 @@ export class ExportService {
     const inputPath = join(this.tempDir, `input-${Date.now()}.mp4`);
 
     this.logger.log(`Download start: ${videoUrl}`);
+    const dlStart = Date.now();
     try {
       await execPromise(`curl -fSL -o "${inputPath}" "${videoUrl}"`, {
         maxBuffer: 10 * 1024 * 1024,
@@ -43,7 +44,9 @@ export class ExportService {
         `Failed to download video: ${(err as Error).message}`,
       );
     }
-    this.logger.log(`Download end: ${inputPath}`);
+    this.logger.log(
+      `Download end (${((Date.now() - dlStart) / 1000).toFixed(1)}s): ${inputPath}`,
+    );
     return inputPath;
   }
 
@@ -75,6 +78,7 @@ export class ExportService {
 
     const outputPath = join(this.tempDir, `output-${Date.now()}.mp4`);
     const segmentPaths: string[] = [];
+    const totalStart = Date.now();
 
     try {
       for (let i = 0; i < merged.length; i++) {
@@ -86,10 +90,13 @@ export class ExportService {
         this.logger.log(
           `ffmpeg start: segment ${i + 1}/${merged.length} (${start}s, ${duration}s)`,
         );
+        const segStart = Date.now();
         await execPromise(
-          `ffmpeg -ss ${start} -i "${inputPath}" -t ${duration} -c copy -fflags +genpts -copyts "${outputPath}`,
+          `ffmpeg -ss ${start} -i "${inputPath}" -t ${duration}  -c copy -avoid_negative_ts 1 "${segPath}"`,
         );
-        this.logger.log(`ffmpeg end: segment ${i + 1}/${merged.length}`);
+        this.logger.log(
+          `ffmpeg end: segment ${i + 1}/${merged.length} (${((Date.now() - segStart) / 1000).toFixed(1)}s)`,
+        );
       }
 
       if (segmentPaths.length === 1) {
@@ -101,10 +108,13 @@ export class ExportService {
         await fs.writeFile(concatListPath, concatContent);
 
         this.logger.log(`ffmpeg start: concat ${segmentPaths.length} segments`);
+        const concatStart = Date.now();
         await execPromise(
           `ffmpeg -f concat -safe 0 -i "${concatListPath}" -c copy "${outputPath}"`,
         );
-        this.logger.log('ffmpeg end: concat');
+        this.logger.log(
+          `ffmpeg end: concat (${((Date.now() - concatStart) / 1000).toFixed(1)}s)`,
+        );
 
         await fs.unlink(concatListPath).catch(() => {});
       }
@@ -126,7 +136,8 @@ export class ExportService {
       }
     }
 
-    this.logger.log(`Processing complete: ${outputPath}`);
+    const totalSec = ((Date.now() - totalStart) / 1000).toFixed(1);
+    this.logger.log(`Processing complete (${totalSec}s total): ${outputPath}`);
     return outputPath;
   }
 
