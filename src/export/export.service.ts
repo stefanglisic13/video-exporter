@@ -5,7 +5,9 @@ import {
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { exec } from 'child_process';
+import { createHash } from 'crypto';
 import { promises as fs } from 'fs';
 import { join } from 'path';
 import { promisify } from 'util';
@@ -13,27 +15,60 @@ import { SegmentDto } from './dto/export-without-idle-time.dto';
 
 const execPromise = promisify(exec);
 
+interface CacheEntry {
+  filePath: string;
+  cachedAt: number;
+}
+
 @Injectable()
 export class ExportService {
   private readonly logger = new Logger(ExportService.name);
   private readonly tempDir: string;
+  private readonly cacheTtlMs: number;
+  private readonly cache = new Map<string, CacheEntry>();
 
   constructor(private readonly configService: ConfigService) {
     this.tempDir = this.configService.get<string>(
       'TEMP_DIR',
       '/tmp/video-exporter',
     );
+    const ttlMinutes = parseInt(
+      this.configService.get<string>('CACHE_TTL_MINUTES', '30'),
+      10,
+    );
+    this.cacheTtlMs = ttlMinutes * 60 * 1000;
+    this.logger.log(`Video cache TTL: ${ttlMinutes} minutes`);
   }
 
   async ensureTempDir(): Promise<void> {
     await fs.mkdir(this.tempDir, { recursive: true });
   }
 
+  private getCacheKey(videoUrl: string): string {
+    const pathname = new URL(videoUrl).pathname;
+    return createHash('sha256').update(pathname).digest('hex').slice(0, 16);
+  }
+
   async downloadVideo(videoUrl: string): Promise<string> {
     await this.ensureTempDir();
-    const inputPath = join(this.tempDir, `input-${Date.now()}.mp4`);
 
-    this.logger.log(`Download start: ${videoUrl}`);
+    const cacheKey = this.getCacheKey(videoUrl);
+    const cached = this.cache.get(cacheKey);
+
+    if (cached) {
+      try {
+        await fs.access(cached.filePath);
+        this.logger.log(`Cache hit (${cacheKey}): ${cached.filePath}`);
+        return cached.filePath;
+      } catch {
+        this.logger.warn(`Cache stale (file missing), re-downloading`);
+        this.cache.delete(cacheKey);
+      }
+    }
+
+    const inputPath = join(this.tempDir, `cache-${cacheKey}.mp4`);
+
+    this.logger.log(`Cache miss (${cacheKey}), downloading...`);
     const dlStart = Date.now();
     try {
       await execPromise(`curl -fSL -o "${inputPath}" "${videoUrl}"`, {
@@ -44,10 +79,35 @@ export class ExportService {
         `Failed to download video: ${(err as Error).message}`,
       );
     }
+
+    this.cache.set(cacheKey, { filePath: inputPath, cachedAt: Date.now() });
     this.logger.log(
-      `Download end (${((Date.now() - dlStart) / 1000).toFixed(1)}s): ${inputPath}`,
+      `Download complete (${((Date.now() - dlStart) / 1000).toFixed(1)}s): ${inputPath}`,
     );
     return inputPath;
+  }
+
+  @Cron(CronExpression.EVERY_MINUTE)
+  async evictExpiredCache(): Promise<void> {
+    const now = Date.now();
+    let evicted = 0;
+
+    const keys = Array.from(this.cache.keys());
+    for (const key of keys) {
+      const entry = this.cache.get(key)!;
+      if (now - entry.cachedAt > this.cacheTtlMs) {
+        await fs.unlink(entry.filePath).catch(() => {});
+        this.cache.delete(key);
+        this.logger.log(`Cache evicted (${key}): ${entry.filePath}`);
+        evicted++;
+      }
+    }
+
+    if (evicted > 0) {
+      this.logger.log(
+        `Cache cleanup: evicted ${evicted}, remaining ${this.cache.size}`,
+      );
+    }
   }
 
   private sortAndMergeSegments(segments: SegmentDto[]): SegmentDto[] {
@@ -118,10 +178,6 @@ export class ExportService {
 
         await fs.unlink(concatListPath).catch(() => {});
       }
-
-      // Delete input file after processing
-      await fs.unlink(inputPath).catch(() => {});
-      this.logger.log(`Deleted input file: ${inputPath}`);
     } catch (err) {
       // Clean up any segment temp files on error
       for (const p of segmentPaths) {

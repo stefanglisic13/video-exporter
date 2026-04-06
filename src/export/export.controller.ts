@@ -15,7 +15,6 @@ export class ExportController {
     @Body() dto: ExportWithoutIdleTimeDto,
     @Res() res: Response,
   ) {
-    let inputPath: string | undefined;
     let outputPath: string | undefined;
 
     try {
@@ -23,7 +22,7 @@ export class ExportController {
         `Export request: ${dto.segments.length} segments, url=${dto.videoUrl}`,
       );
 
-      inputPath = await this.exportService.downloadVideo(dto.videoUrl);
+      const inputPath = await this.exportService.downloadVideo(dto.videoUrl);
       outputPath = await this.exportService.processVideo(
         inputPath,
         dto.segments,
@@ -41,18 +40,17 @@ export class ExportController {
       const fileStream = createReadStream(outputPath);
 
       fileStream.on('end', () => {
-        void this.exportService.cleanup(inputPath!, outputPath!);
+        void this.exportService.cleanup(outputPath!);
       });
 
       fileStream.on('error', () => {
-        void this.exportService.cleanup(inputPath!, outputPath!);
+        void this.exportService.cleanup(outputPath!);
       });
 
       fileStream.pipe(res);
     } catch (error) {
-      const toClean = [inputPath, outputPath].filter((p): p is string => !!p);
-      if (toClean.length) {
-        await this.exportService.cleanup(...toClean);
+      if (outputPath) {
+        await this.exportService.cleanup(outputPath);
       }
       throw error;
     }
