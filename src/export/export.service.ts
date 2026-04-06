@@ -127,6 +127,33 @@ export class ExportService {
     return merged;
   }
 
+  async trimVideo(
+    inputPath: string,
+    trimStartMs: number,
+    trimEndMs: number,
+  ): Promise<string> {
+    const startSec = trimStartMs / 1000;
+    const durationSec = (trimEndMs - trimStartMs) / 1000;
+    const outputPath = join(this.tempDir, `output-${Date.now()}.mp4`);
+
+    this.logger.log(`trimVideo start: ${startSec}s, duration=${durationSec}s`);
+    const t0 = Date.now();
+    try {
+      await execPromise(
+        `ffmpeg -ss ${startSec} -i "${inputPath}" -t ${durationSec} -c copy -avoid_negative_ts 1 "${outputPath}"`,
+      );
+    } catch (err) {
+      throw new InternalServerErrorException(
+        `Trim failed: ${(err as Error).message}`,
+      );
+    }
+    this.logger.log(
+      `trimVideo end (${((Date.now() - t0) / 1000).toFixed(1)}s): ${outputPath}`,
+    );
+    await this.trimBlackStart(outputPath);
+    return outputPath;
+  }
+
   async processVideo(
     inputPath: string,
     segments: SegmentDto[],
@@ -192,8 +219,25 @@ export class ExportService {
       }
     }
 
+    await this.trimBlackStart(outputPath);
     const totalSec = ((Date.now() - totalStart) / 1000).toFixed(1);
     this.logger.log(`Processing complete (${totalSec}s total): ${outputPath}`);
+    return outputPath;
+  }
+
+  private async trimBlackStart(outputPath: string): Promise<string> {
+    const trimmedPath = outputPath.replace('.mp4', '-trimmed.mp4');
+    this.logger.log('Trimming first 0.1s from output...');
+    try {
+      await execPromise(
+        `ffmpeg -ss 0.1 -i "${outputPath}" -c copy "${trimmedPath}"`,
+      );
+      await fs.unlink(outputPath).catch(() => {});
+      await fs.rename(trimmedPath, outputPath);
+    } catch {
+      await fs.unlink(trimmedPath).catch(() => {});
+      this.logger.warn('trimBlackStart failed, keeping original');
+    }
     return outputPath;
   }
 
