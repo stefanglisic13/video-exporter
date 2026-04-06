@@ -87,7 +87,7 @@ export class ExportService {
           `ffmpeg start: segment ${i + 1}/${merged.length} (${start}s, ${duration}s)`,
         );
         await execPromise(
-          `ffmpeg -ss ${start} -i "${inputPath}" -t ${duration} -c copy -avoid_negative_ts 1 "${segPath}"`,
+          `ffmpeg -i "${inputPath}" -ss ${start} -t ${duration} -c copy -avoid_negative_ts 1 "${segPath}"`,
         );
         this.logger.log(`ffmpeg end: segment ${i + 1}/${merged.length}`);
       }
