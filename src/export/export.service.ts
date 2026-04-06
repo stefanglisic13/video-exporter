@@ -5,12 +5,13 @@ import {
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import * as ffmpeg from 'fluent-ffmpeg';
-import { createWriteStream, promises as fs } from 'fs';
+import { exec } from 'child_process';
+import { promises as fs } from 'fs';
 import { join } from 'path';
-import { pipeline } from 'stream/promises';
-import { v4 as uuidv4 } from 'uuid';
+import { promisify } from 'util';
 import { SegmentDto } from './dto/export-without-idle-time.dto';
+
+const execPromise = promisify(exec);
 
 @Injectable()
 export class ExportService {
@@ -30,19 +31,19 @@ export class ExportService {
 
   async downloadVideo(videoUrl: string): Promise<string> {
     await this.ensureTempDir();
-    const inputPath = join(this.tempDir, `input-${uuidv4()}.mp4`);
+    const inputPath = join(this.tempDir, `input-${Date.now()}.mp4`);
 
-    const response = await fetch(videoUrl);
-    if (!response.ok) {
+    this.logger.log(`Download start: ${videoUrl}`);
+    try {
+      await execPromise(`curl -fSL -o "${inputPath}" "${videoUrl}"`, {
+        maxBuffer: 10 * 1024 * 1024,
+      });
+    } catch (err) {
       throw new BadRequestException(
-        `Failed to download video: ${response.status} ${response.statusText}`,
+        `Failed to download video: ${(err as Error).message}`,
       );
     }
-
-    const fileStream = createWriteStream(inputPath);
-    await pipeline(response.body as any, fileStream);
-
-    this.logger.log(`Downloaded video to ${inputPath}`);
+    this.logger.log(`Download end: ${inputPath}`);
     return inputPath;
   }
 
@@ -63,16 +64,6 @@ export class ExportService {
     return merged;
   }
 
-  private async probeHasAudio(inputPath: string): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      ffmpeg.ffprobe(inputPath, (err, metadata) => {
-        if (err) return reject(new Error(String(err)));
-        const hasAudio = metadata.streams.some((s) => s.codec_type === 'audio');
-        resolve(hasAudio);
-      });
-    });
-  }
-
   async processVideo(
     inputPath: string,
     segments: SegmentDto[],
@@ -82,73 +73,61 @@ export class ExportService {
       throw new BadRequestException('No valid segments provided');
     }
 
-    const outputPath = join(this.tempDir, `output-${uuidv4()}.mp4`);
-    const hasAudio = await this.probeHasAudio(inputPath);
+    const outputPath = join(this.tempDir, `output-${Date.now()}.mp4`);
+    const segmentPaths: string[] = [];
 
-    const filterParts: string[] = [];
-    const concatInputs: string[] = [];
+    try {
+      for (let i = 0; i < merged.length; i++) {
+        const start = merged[i].startMs / 1000;
+        const duration = (merged[i].endMs - merged[i].startMs) / 1000;
+        const segPath = join(this.tempDir, `seg-${Date.now()}-${i}.mp4`);
+        segmentPaths.push(segPath);
 
-    for (let i = 0; i < merged.length; i++) {
-      const startSec = merged[i].startMs / 1000;
-      const endSec = merged[i].endMs / 1000;
-
-      filterParts.push(
-        `[0:v]trim=start=${startSec}:end=${endSec},setpts=PTS-STARTPTS[v${i}]`,
-      );
-      concatInputs.push(`[v${i}]`);
-
-      if (hasAudio) {
-        filterParts.push(
-          `[0:a]atrim=start=${startSec}:end=${endSec},asetpts=PTS-STARTPTS[a${i}]`,
+        this.logger.log(
+          `ffmpeg start: segment ${i + 1}/${merged.length} (${start}s, ${duration}s)`,
         );
-        concatInputs.push(`[a${i}]`);
+        await execPromise(
+          `ffmpeg -ss ${start} -i "${inputPath}" -t ${duration} -c copy -avoid_negative_ts 1 "${segPath}"`,
+        );
+        this.logger.log(`ffmpeg end: segment ${i + 1}/${merged.length}`);
+      }
+
+      if (segmentPaths.length === 1) {
+        await fs.rename(segmentPaths[0], outputPath);
+        segmentPaths.length = 0;
+      } else {
+        const concatListPath = join(this.tempDir, `concat-${Date.now()}.txt`);
+        const concatContent = segmentPaths.map((p) => `file '${p}'`).join('\n');
+        await fs.writeFile(concatListPath, concatContent);
+
+        this.logger.log(`ffmpeg start: concat ${segmentPaths.length} segments`);
+        await execPromise(
+          `ffmpeg -f concat -safe 0 -i "${concatListPath}" -c copy "${outputPath}"`,
+        );
+        this.logger.log('ffmpeg end: concat');
+
+        await fs.unlink(concatListPath).catch(() => {});
+      }
+
+      // Delete input file after processing
+      await fs.unlink(inputPath).catch(() => {});
+      this.logger.log(`Deleted input file: ${inputPath}`);
+    } catch (err) {
+      // Clean up any segment temp files on error
+      for (const p of segmentPaths) {
+        await fs.unlink(p).catch(() => {});
+      }
+      throw new InternalServerErrorException(
+        `Video processing failed: ${(err as Error).message}`,
+      );
+    } finally {
+      for (const p of segmentPaths) {
+        await fs.unlink(p).catch(() => {});
       }
     }
 
-    const audioFlag = hasAudio ? 1 : 0;
-    const concatFilter = `${concatInputs.join('')}concat=n=${merged.length}:v=1:a=${audioFlag}[outv]${hasAudio ? '[outa]' : ''}`;
-    filterParts.push(concatFilter);
-
-    const filterComplex = filterParts.join('; ');
-
-    this.logger.log(
-      `Processing ${merged.length} segments, hasAudio=${hasAudio}`,
-    );
-
-    return new Promise((resolve, reject) => {
-      let cmd = ffmpeg(inputPath)
-        .complexFilter(filterComplex)
-        .outputOptions('-map', '[outv]');
-
-      if (hasAudio) {
-        cmd = cmd.outputOptions('-map', '[outa]');
-      }
-
-      cmd
-        .outputOptions('-movflags', '+faststart')
-        .output(outputPath)
-        .on('start', (commandLine) => {
-          this.logger.log(`ffmpeg command: ${commandLine}`);
-        })
-        .on('progress', (progress) => {
-          if (progress.percent) {
-            this.logger.log(`Processing: ${progress.percent.toFixed(1)}%`);
-          }
-        })
-        .on('end', () => {
-          this.logger.log(`Processing complete: ${outputPath}`);
-          resolve(outputPath);
-        })
-        .on('error', (err) => {
-          this.logger.error(`ffmpeg error: ${err.message}`);
-          reject(
-            new InternalServerErrorException(
-              `Video processing failed: ${err.message}`,
-            ),
-          );
-        })
-        .run();
-    });
+    this.logger.log(`Processing complete: ${outputPath}`);
+    return outputPath;
   }
 
   async cleanup(...paths: string[]): Promise<void> {
